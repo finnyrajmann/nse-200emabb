@@ -1,0 +1,571 @@
+"""
+NSE 200EMABB — DO Functions Entry Point
+=========================================
+Uses only requests + standard library (no pip installs needed).
+- Yahoo Finance API for price data (OHLC)
+- GitHub REST API for reading/writing CSV data
+- Gmail SMTP for notifications
+
+Design summary (locked, Sep 2026):
+- Watchlist is pre-vetted uptrend-only by a SEPARATE periodic screener
+  (EMA200 3-checkpoint slope check + price-above-EMA200). This system does
+  NOT re-verify EMA200 itself — it trusts the watchlist.
+- Entry: 9 EMA currently above 30 EMA (no fresh-cross requirement — if
+  it's already true and there's no open position, that's a signal).
+- Target exit: price touches/exceeds BB-upper (20, 2 std).
+- Stop exit: EITHER 9 EMA currently below 30 EMA, OR price <= 10% below
+  the highest daily HIGH since entry (trailing stop). If both conditions
+  are true on the same day, a distinct third ExitReason (STOP_BOTH) is
+  logged rather than picking one arbitrarily.
+- Hit/miss split: trades are written into one of two trade logs instead
+  of a single combined log. Hit = PnL% > 3.0, Miss = PnL% <= 3.0
+  (this also covers flat and losing trades).
+- File naming: system code as SUFFIX everywhere —
+  watchlist_200emabb.csv, positions_200emabb.csv,
+  trade_log_hit_200emabb.csv, trade_log_miss_200emabb.csv
+"""
+
+import os
+import csv
+import smtplib
+import time
+import base64
+import math
+from io import StringIO
+from datetime import datetime, date
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import requests
+
+# ─────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────
+SYSTEM_CODE      = "200emabb"
+
+BB_PERIOD        = 20
+BB_STD           = 2
+EMA_FAST         = 9
+EMA_SLOW         = 30
+TRAIL_STOP_PCT   = 10.0
+POSITION_SIZE    = 10000
+SLEEP            = 0.5
+HIT_THRESHOLD_PCT = 3.0   # PnL% strictly greater than this -> hit, else -> miss
+
+DATA_PERIOD      = "1y"   # same as BB Trader; the deep 2y/300-close lookback
+                           # needed for the EMA200 3-checkpoint check lives in
+                           # the separate watchlist screener, not here.
+
+
+# ─────────────────────────────────────────────
+# YAHOO FINANCE
+# ─────────────────────────────────────────────
+def fetch_price_bars(symbol, period=DATA_PERIOD):
+    """
+    Fetch daily OHLC bars for a symbol.
+    Returns a list of dicts: {'date': date, 'open', 'high', 'low', 'close'}
+    ordered oldest -> newest. Returns None on failure.
+    """
+    ticker = symbol.upper().strip()
+    if not ticker.startswith("^"):
+        ticker = ticker + ".NS"
+
+    params = {
+        'range':    period,
+        'interval': '1d',
+        'events':   'history',
+    }
+    headers = {'User-Agent': 'Mozilla/5.0'}
+
+    for host in ['query1', 'query2']:
+        try:
+            url = f"https://{host}.finance.yahoo.com/v8/finance/chart/{ticker}"
+            r = requests.get(url, params=params, headers=headers, timeout=15)
+            data = r.json()
+            result = data['chart']['result'][0]
+            timestamps = result['timestamp']
+            quote = result['indicators']['quote'][0]
+            opens  = quote['open']
+            highs  = quote['high']
+            lows   = quote['low']
+            closes = quote['close']
+
+            bars = []
+            for i, ts in enumerate(timestamps):
+                c = closes[i]
+                if c is None:
+                    continue
+                bars.append({
+                    'date':  datetime.utcfromtimestamp(ts).date(),
+                    'open':  opens[i] if opens[i] is not None else c,
+                    'high':  highs[i] if highs[i] is not None else c,
+                    'low':   lows[i] if lows[i] is not None else c,
+                    'close': c,
+                })
+            if bars:
+                return bars
+        except Exception:
+            continue
+    return None
+
+
+def calc_ema(values, period):
+    """Calculate EMA over a list of closes (oldest -> newest)."""
+    if len(values) < period:
+        return None
+    k = 2 / (period + 1)
+    ema = sum(values[:period]) / period
+    for v in values[period:]:
+        ema = v * k + ema * (1 - k)
+    return round(ema, 2)
+
+
+def calc_bb(closes, period=BB_PERIOD, std_mult=BB_STD):
+    """Calculate Bollinger Bands from the last N closes."""
+    if len(closes) < period + 2:
+        return None
+    window   = closes[-period:]
+    mean     = sum(window) / period
+    variance = sum((x - mean) ** 2 for x in window) / period
+    std      = math.sqrt(variance)
+    return {
+        'bb_mid':   round(mean, 2),
+        'bb_upper': round(mean + std_mult * std, 2),
+        'bb_lower': round(mean - std_mult * std, 2),
+    }
+
+
+def get_indicators(symbol, period=DATA_PERIOD):
+    """Get price + BB + 9/30 EMA indicators + raw bars for a symbol."""
+    bars = fetch_price_bars(symbol, period)
+    if not bars or len(bars) < BB_PERIOD + 2:
+        return None
+
+    closes = [b['close'] for b in bars]
+    price  = round(closes[-1], 2)
+    prev   = round(closes[-2], 2) if len(closes) > 1 else price
+    change = round((price - prev) / prev * 100, 2) if prev else 0.0
+
+    bb = calc_bb(closes)
+    if bb is None:
+        return None
+
+    ema9  = calc_ema(closes, EMA_FAST)
+    ema30 = calc_ema(closes, EMA_SLOW)
+
+    return {
+        'price':    price,
+        'change':   change,
+        'bb_upper': bb['bb_upper'],
+        'bb_mid':   bb['bb_mid'],
+        'bb_lower': bb['bb_lower'],
+        'ema9':     ema9,
+        'ema30':    ema30,
+        'bars':     bars,
+        'closes':   closes,
+    }
+
+
+def high_since(bars, entry_dt):
+    """Highest daily HIGH from entry_dt (inclusive) to the most recent bar."""
+    relevant = [b['high'] for b in bars if b['date'] >= entry_dt]
+    if not relevant:
+        return bars[-1]['high'] if bars else None
+    return max(relevant)
+
+
+# ─────────────────────────────────────────────
+# GITHUB REST API
+# ─────────────────────────────────────────────
+def github_get(repo, path, pat):
+    """Read a file from GitHub. Returns (content, sha)."""
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    headers = {
+        'Authorization': f'token {pat}',
+        'Accept': 'application/vnd.github.v3+json',
+    }
+    r = requests.get(url, headers=headers, timeout=15)
+    r.raise_for_status()
+    data    = r.json()
+    content = base64.b64decode(data['content']).decode('utf-8')
+    return content, data['sha']
+
+
+def github_put(repo, path, pat, content, sha, message):
+    """Write a file to GitHub."""
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    headers = {
+        'Authorization': f'token {pat}',
+        'Accept': 'application/vnd.github.v3+json',
+    }
+    payload = {
+        'message': message,
+        'content': base64.b64encode(content.encode('utf-8')).decode('utf-8'),
+        'sha':     sha,
+    }
+    r = requests.put(url, headers=headers, json=payload, timeout=15)
+    r.raise_for_status()
+    return True
+
+
+def parse_csv(content):
+    reader = csv.DictReader(StringIO(content))
+    return list(reader)
+
+
+def to_csv(rows, fieldnames):
+    out    = StringIO()
+    writer = csv.DictWriter(out, fieldnames=fieldnames, extrasaction='ignore')
+    writer.writeheader()
+    writer.writerows(rows)
+    return out.getvalue()
+
+
+# ─────────────────────────────────────────────
+# EXIT MONITOR
+# ─────────────────────────────────────────────
+def run_exit(positions, hit_log, miss_log):
+    """
+    Check every open position for target/stop conditions.
+    Returns (exits, holds, remaining_positions, updated_hit_log, updated_miss_log)
+    """
+    exits         = []
+    holds         = []
+    new_positions = []
+    hit_log       = list(hit_log)
+    miss_log      = list(miss_log)
+
+    for pos in positions:
+        symbol      = pos['Symbol']
+        entry_price = float(pos['EntryPrice'])
+        quantity    = int(pos['Quantity'])
+        entry_date  = datetime.strptime(pos['EntryDate'], '%Y-%m-%d')
+        track_type  = pos['TrackType']
+        capital     = round(entry_price * quantity, 2)
+        days_held   = (datetime.now() - entry_date).days
+
+        ind = get_indicators(symbol)
+        if ind is None:
+            new_positions.append(pos)
+            continue
+
+        price = ind['price']
+
+        # Trailing stop reference: highest daily HIGH since entry date
+        hi_since = high_since(ind['bars'], entry_date.date())
+        trail_stop_price = round(hi_since * (1 - TRAIL_STOP_PCT / 100), 2) if hi_since else None
+
+        target_hit = price >= ind['bb_upper']
+        ema_stop   = (ind['ema9'] is not None and ind['ema30'] is not None
+                      and ind['ema9'] < ind['ema30'])
+        trail_stop = trail_stop_price is not None and price <= trail_stop_price
+
+        exit_type   = None
+        exit_reason = None
+
+        if target_hit:
+            exit_type   = 'TARGET'
+            exit_reason = f"Price at/above BB Upper ({ind['bb_upper']})"
+        elif ema_stop and trail_stop:
+            exit_type   = 'STOP_BOTH'
+            exit_reason = (f"9EMA<30EMA ({ind['ema9']}<{ind['ema30']}) AND "
+                            f"trailing stop hit ({trail_stop_price}, "
+                            f"high since entry {hi_since})")
+        elif ema_stop:
+            exit_type   = 'STOP_EMA'
+            exit_reason = f"9EMA crossed below 30EMA ({ind['ema9']} < {ind['ema30']})"
+        elif trail_stop:
+            exit_type   = 'STOP_TRAIL'
+            exit_reason = f"Trailing stop hit ({trail_stop_price}, high since entry {hi_since})"
+
+        pnl     = round((price - entry_price) * quantity, 2)
+        pnl_pct = round((price - entry_price) / entry_price * 100, 2)
+
+        if exit_type:
+            record = {
+                'Symbol':     symbol,
+                'EntryDate':  pos['EntryDate'],
+                'EntryPrice': entry_price,
+                'Quantity':   quantity,
+                'Capital':    capital,
+                'ExitDate':   datetime.now().strftime('%Y-%m-%d'),
+                'ExitPrice':  price,
+                'PnL':        pnl,
+                'PnL%':       pnl_pct,
+                'DaysHeld':   days_held,
+                'ExitReason': exit_reason,
+                'TrackType':  track_type,
+            }
+            exits.append(record)
+            if pnl_pct > HIT_THRESHOLD_PCT:
+                hit_log.append(record)
+            else:
+                miss_log.append(record)
+        else:
+            new_positions.append(pos)
+            holds.append({
+                'Symbol':     symbol,
+                'EntryPrice': entry_price,
+                'Price':      price,
+                'PnL':        pnl,
+                'PnL%':       pnl_pct,
+                'DaysHeld':   days_held,
+            })
+
+    return exits, holds, new_positions, hit_log, miss_log
+
+
+# ─────────────────────────────────────────────
+# ENTRY SCANNER
+# ─────────────────────────────────────────────
+def run_entry(watchlist, positions):
+    """
+    Watchlist is assumed pre-vetted (uptrend-only, via the separate monthly
+    screener). Entry signal here is purely: 9 EMA currently above 30 EMA.
+    """
+    open_symbols = {p['Symbol'] for p in positions}
+    new_entries  = []
+
+    for row in watchlist:
+        symbol = row['Symbol'].strip()
+        if symbol in open_symbols:
+            continue
+
+        ind = get_indicators(symbol)
+        if ind is None:
+            time.sleep(SLEEP)
+            continue
+
+        if ind['ema9'] is None or ind['ema30'] is None:
+            time.sleep(SLEEP)
+            continue
+
+        if ind['ema9'] > ind['ema30']:
+            quantity = max(1, int(POSITION_SIZE / ind['price']))
+            positions.append({
+                'Symbol':     symbol,
+                'EntryDate':  datetime.now().strftime('%Y-%m-%d'),
+                'EntryPrice': ind['price'],
+                'Quantity':   quantity,
+                'TrackType':  'Paper',
+            })
+            open_symbols.add(symbol)
+            new_entries.append({
+                'Symbol':   symbol,
+                'Industry': row.get('Industry', ''),
+                'Price':    ind['price'],
+                'EMA9':     ind['ema9'],
+                'EMA30':    ind['ema30'],
+                'BB Upper': ind['bb_upper'],
+            })
+            print(f"  Entry: {symbol} @ Rs.{ind['price']} "
+                  f"(9EMA {ind['ema9']} > 30EMA {ind['ema30']})")
+
+        time.sleep(SLEEP)
+
+    return new_entries, positions
+
+
+# ─────────────────────────────────────────────
+# EMAIL
+# ─────────────────────────────────────────────
+def send_email(exits, entries, holds):
+    sender    = os.environ.get('GMAIL_SENDER')
+    password  = os.environ.get('GMAIL_APP_PASSWORD')
+    recipient = os.environ.get('GMAIL_RECIPIENT')
+    repo_name = os.environ.get('GITHUB_REPO')
+    today     = datetime.now().strftime('%d %b %Y')
+    subject   = f"NSE 200EMABB — {today} | {len(entries)} new | {len(holds)} open"
+
+    def table_style():
+        return 'border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:14px;'
+
+    def th_style():
+        return 'background:#2c3e50;color:#fff;padding:8px 12px;text-align:left;'
+
+    def td_style(align='left'):
+        return f'padding:7px 12px;border-bottom:1px solid #eee;text-align:{align};'
+
+    def section_header(title):
+        return f'<h3 style="color:#2c3e50;margin:24px 0 8px 0;">{title}</h3>'
+
+    hits  = [e for e in exits if e['PnL%'] > HIT_THRESHOLD_PCT]
+    misses = [e for e in exits if e['PnL%'] <= HIT_THRESHOLD_PCT]
+
+    html = f'''
+    <div style="font-family:Arial,sans-serif;max-width:700px;margin:0 auto;">
+    <h2 style="background:#2c3e50;color:#fff;padding:14px 18px;margin:0;border-radius:4px 4px 0 0;">
+        NSE 200EMABB — {today}
+    </h2>
+    '''
+
+    # EXITS
+    html += section_header(
+        f'Exits Today ({len(exits)}) &mdash; {len(hits)} hit / {len(misses)} miss'
+    ) if exits else section_header('Exits: None today')
+    if exits:
+        html += f'<table style="{table_style()}"><thead><tr>'
+        for col in ['', 'Symbol', 'P&L %', 'P&L Rs', 'Days', 'Reason']:
+            html += f'<th style="{th_style()}">{col}</th>'
+        html += '</tr></thead><tbody>'
+        for r in exits:
+            icon = '[H]' if r['PnL%'] > HIT_THRESHOLD_PCT else '[M]'
+            html += f'''<tr>
+                <td style="{td_style()}">{icon}</td>
+                <td style="{td_style()}"><b>{r['Symbol']}</b></td>
+                <td style="{td_style('right')}">{r['PnL%']:+.2f}%</td>
+                <td style="{td_style('right')}">Rs.{r['PnL']:+.0f}</td>
+                <td style="{td_style('right')}">{r['DaysHeld']}d</td>
+                <td style="{td_style()}">{r['ExitReason']}</td>
+            </tr>'''
+        html += '</tbody></table>'
+
+    # ENTRIES
+    html += section_header(f'New Paper Entries ({len(entries)})') if entries else section_header('New Entries: None today')
+    if entries:
+        html += f'<table style="{table_style()}"><thead><tr>'
+        for col in ['Symbol', 'Industry', 'Price Rs', '9EMA', '30EMA', 'BB Upper Rs']:
+            html += f'<th style="{th_style()}">{col}</th>'
+        html += '</tr></thead><tbody>'
+        for e in entries:
+            html += f'''<tr>
+                <td style="{td_style()}"><b>{e['Symbol']}</b></td>
+                <td style="{td_style()}">{e['Industry']}</td>
+                <td style="{td_style('right')}">Rs.{e['Price']}</td>
+                <td style="{td_style('right')}">{e['EMA9']}</td>
+                <td style="{td_style('right')}">{e['EMA30']}</td>
+                <td style="{td_style('right')}">Rs.{e['BB Upper']}</td>
+            </tr>'''
+        html += '</tbody></table>'
+
+    # OPEN POSITIONS
+    if holds:
+        total_pnl = sum(r['PnL'] for r in holds)
+        pnl_color = '#27ae60' if total_pnl >= 0 else '#e74c3c'
+        html += section_header(
+            f'Open Positions ({len(holds)}) &nbsp;|&nbsp; '
+            f'Total P&L: <span style="color:{pnl_color}">Rs.{total_pnl:+.0f}</span>'
+        )
+        html += f'<table style="{table_style()}"><thead><tr>'
+        for col in ['', 'Symbol', 'Entry Rs', 'Price Rs', 'P&L %', 'P&L Rs', 'Days']:
+            html += f'<th style="{th_style()}">{col}</th>'
+        html += '</tr></thead><tbody>'
+        for r in holds:
+            icon = '[+]' if r['PnL'] >= 0 else '[-]'
+            html += f'''<tr>
+                <td style="{td_style()}">{icon}</td>
+                <td style="{td_style()}"><b>{r['Symbol']}</b></td>
+                <td style="{td_style('right')}">Rs.{r['EntryPrice']:.2f}</td>
+                <td style="{td_style('right')}">Rs.{r['Price']:.2f}</td>
+                <td style="{td_style('right')}">{r['PnL%']:+.2f}%</td>
+                <td style="{td_style('right')}">Rs.{r['PnL']:+.0f}</td>
+                <td style="{td_style('right')}">{r['DaysHeld']}d</td>
+            </tr>'''
+        html += '</tbody></table>'
+    else:
+        html += section_header('Open Positions: None')
+
+    # FOOTER
+    html += f'''
+    <p style="margin-top:24px;font-size:12px;color:#888;">
+        <a href="https://github.com/{repo_name}/blob/master/data/trade_log_hit_{SYSTEM_CODE}.csv" style="color:#2c3e50;">
+            View hit log
+        </a> &nbsp;|&nbsp;
+        <a href="https://github.com/{repo_name}/blob/master/data/trade_log_miss_{SYSTEM_CODE}.csv" style="color:#2c3e50;">
+            View miss log
+        </a><br>
+        — NSE 200EMABB (automated)
+    </p>
+    </div>
+    '''
+
+    msg = MIMEMultipart()
+    msg['From']    = sender
+    msg['To']      = recipient
+    msg['Subject'] = subject
+    msg.attach(MIMEText(html, 'html'))
+
+    with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+        server.login(sender, password)
+        server.sendmail(sender, recipient, msg.as_string())
+    print(f"  Email sent to {recipient}")
+
+
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
+def main(args):
+    print("\n" + "="*50)
+    print("  NSE 200EMABB — DO Functions Run")
+    print("="*50)
+
+    pat       = os.environ.get('GITHUB_PAT')
+    repo_name = os.environ.get('GITHUB_REPO')
+
+    pos_path      = f'data/positions_{SYSTEM_CODE}.csv'
+    hit_log_path  = f'data/trade_log_hit_{SYSTEM_CODE}.csv'
+    miss_log_path = f'data/trade_log_miss_{SYSTEM_CODE}.csv'
+    wl_path       = f'data/watchlist_{SYSTEM_CODE}.csv'
+
+    try:
+        # Load data from GitHub
+        print("\n[1/5] Loading data from GitHub...")
+        pos_content, pos_sha   = github_get(repo_name, pos_path, pat)
+        hitlog_content, hit_sha = github_get(repo_name, hit_log_path, pat)
+        misslog_content, miss_sha = github_get(repo_name, miss_log_path, pat)
+        wl_content, _          = github_get(repo_name, wl_path, pat)
+
+        positions = parse_csv(pos_content)
+        hit_log   = parse_csv(hitlog_content)
+        miss_log  = parse_csv(misslog_content)
+        watchlist = parse_csv(wl_content)
+        print(f"      {len(positions)} open positions | {len(watchlist)} watchlist stocks")
+
+        # Exit monitor
+        print("\n[2/5] Exit Monitor...")
+        exits, holds, positions, hit_log, miss_log = run_exit(positions, hit_log, miss_log)
+        print(f"      {len(exits)} exit(s) | {len(holds)} holding")
+
+        # Entry scanner
+        print("\n[3/5] Entry Scanner...")
+        entries, positions = run_entry(watchlist, positions)
+        print(f"      {len(entries)} new signal(s)")
+
+        # Add today's entries to holds for email
+        for e in entries:
+            holds.append({
+                'Symbol':     e['Symbol'],
+                'EntryPrice': e['Price'],
+                'Price':      e['Price'],
+                'PnL':        0.0,
+                'PnL%':       0.0,
+                'DaysHeld':   0,
+            })
+
+        # Sync to GitHub
+        print("\n[4/5] Syncing to GitHub...")
+        commit_msg = f"Auto-update — {datetime.now().strftime('%Y-%m-%d')}"
+
+        pos_fields = ['Symbol', 'EntryDate', 'EntryPrice', 'Quantity', 'TrackType']
+        log_fields = ['Symbol', 'EntryDate', 'EntryPrice', 'Quantity', 'Capital',
+                      'ExitDate', 'ExitPrice', 'PnL', 'PnL%', 'DaysHeld',
+                      'ExitReason', 'TrackType']
+
+        github_put(repo_name, pos_path, pat,
+                   to_csv(positions, pos_fields), pos_sha, commit_msg)
+        github_put(repo_name, hit_log_path, pat,
+                   to_csv(hit_log, log_fields), hit_sha, commit_msg)
+        github_put(repo_name, miss_log_path, pat,
+                   to_csv(miss_log, log_fields), miss_sha, commit_msg)
+
+        # Send email
+        print("\n[5/5] Sending email...")
+        send_email(exits, entries, holds)
+
+        print("\n  Done.\n")
+        return {"statusCode": 200, "body": "Pipeline complete"}
+
+    except Exception as e:
+        import traceback
+        print(f"\n  ERROR: {str(e)}")
+        print(traceback.format_exc())
+        return {"statusCode": 500, "body": str(e)}
