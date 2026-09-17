@@ -22,10 +22,13 @@ Automated NSE swing-trading paper system, deployed as a DigitalOcean Function.
 
 ```
 data/
-  positions_200emabb.csv       # open paper positions
-  trade_log_hit_200emabb.csv   # closed trades, PnL% > 3.0
-  trade_log_miss_200emabb.csv  # closed trades, PnL% <= 3.0
-  watchlist_200emabb.csv       # maintained by the separate screener
+  positions_200emabb.csv         # open paper positions
+  trade_log_hit_200emabb.csv     # closed trades, PnL% > 3.0
+  trade_log_miss_200emabb.csv    # closed trades, PnL% <= 3.0
+  watchlist_200emabb.csv         # maintained by the separate screener
+  entry_snapshot_200emabb.csv    # indicator values at moment of entry —
+                                  # independent of positions.csv, never
+                                  # trimmed on exit (permanent record)
 functions/
   project.yml                  # LOCAL ONLY — not checked in, add before DO deploy
   packages/nse_200emabb/daily_run/__main__.py
@@ -36,7 +39,20 @@ functions/
 - `GITHUB_PAT`, `GITHUB_REPO`
 - `GMAIL_SENDER`, `GMAIL_APP_PASSWORD`, `GMAIL_RECIPIENT`
 
+## Known Gaps / Improvements Backlog
+
+- [ ] BB-upper target exit doesn't check EMA trend strength — can chop a
+      sustained uptrend into repeated small trades (exit at target,
+      re-enter next day since 9EMA still > 30EMA). Preferred fix: BB-upper
+      becomes an alert-only signal, real exit gated on EMA weakening or
+      another indicator — pending more chart review. Left as-is for now;
+      watch the trade log for evidence this is actually happening in
+      practice before prioritizing a fix.
+- [ ] Whether to reintroduce a BB(50) condition into entry logic — dropped
+      from entry for feeling like it fought the EMA200 uptrend requirement,
+      but not a final decision. Revisit after more chart review.
+
 ## Status
 
-Design locked (Sep 2026). Not yet deployed — pending `project.yml` setup and
-watchlist screener review.
+Deployed live on DO (`trading` context account), cron `30 03 * * 1-5`.
+Watchlist populated via the separate screener (133 stocks as of first run).

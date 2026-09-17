@@ -46,6 +46,7 @@ BB_PERIOD        = 20
 BB_STD           = 2
 EMA_FAST         = 9
 EMA_SLOW         = 30
+EMA_LONG         = 200
 TRAIL_STOP_PCT   = 10.0
 POSITION_SIZE    = 10000
 SLEEP            = 0.5
@@ -149,8 +150,11 @@ def get_indicators(symbol, period=DATA_PERIOD):
     if bb is None:
         return None
 
-    ema9  = calc_ema(closes, EMA_FAST)
-    ema30 = calc_ema(closes, EMA_SLOW)
+    ema9   = calc_ema(closes, EMA_FAST)
+    ema30  = calc_ema(closes, EMA_SLOW)
+    ema200 = calc_ema(closes, EMA_LONG)   # informational only — the watchlist
+                                           # screener already gates on this;
+                                           # this is just for the entry snapshot
 
     return {
         'price':    price,
@@ -160,6 +164,7 @@ def get_indicators(symbol, period=DATA_PERIOD):
         'bb_lower': bb['bb_lower'],
         'ema9':     ema9,
         'ema30':    ema30,
+        'ema200':   ema200,
         'bars':     bars,
         'closes':   closes,
     }
@@ -317,13 +322,18 @@ def run_exit(positions, hit_log, miss_log):
 # ─────────────────────────────────────────────
 # ENTRY SCANNER
 # ─────────────────────────────────────────────
-def run_entry(watchlist, positions):
+def run_entry(watchlist, positions, entry_snapshots):
     """
     Watchlist is assumed pre-vetted (uptrend-only, via the separate monthly
     screener). Entry signal here is purely: 9 EMA currently above 30 EMA.
+
+    entry_snapshots: existing rows from entry_snapshot_200emabb.csv — a
+    permanent, positions-independent record of the indicator values at the
+    moment of each entry. Appended to, never trimmed on exit.
     """
-    open_symbols = {p['Symbol'] for p in positions}
-    new_entries  = []
+    open_symbols    = {p['Symbol'] for p in positions}
+    new_entries     = []
+    entry_snapshots = list(entry_snapshots)
 
     for row in watchlist:
         symbol = row['Symbol'].strip()
@@ -340,15 +350,28 @@ def run_entry(watchlist, positions):
             continue
 
         if ind['ema9'] > ind['ema30']:
-            quantity = max(1, int(POSITION_SIZE / ind['price']))
+            quantity   = max(1, int(POSITION_SIZE / ind['price']))
+            entry_date = datetime.now().strftime('%Y-%m-%d')
+
             positions.append({
                 'Symbol':     symbol,
-                'EntryDate':  datetime.now().strftime('%Y-%m-%d'),
+                'EntryDate':  entry_date,
                 'EntryPrice': ind['price'],
                 'Quantity':   quantity,
                 'TrackType':  'Paper',
             })
             open_symbols.add(symbol)
+
+            entry_snapshots.append({
+                'Symbol':    symbol,
+                'EntryDate': entry_date,
+                'Price':     ind['price'],
+                'EMA9':      ind['ema9'],
+                'EMA30':     ind['ema30'],
+                'EMA200':    ind['ema200'] if ind['ema200'] is not None else '',
+                'BBUpper':   ind['bb_upper'],
+            })
+
             new_entries.append({
                 'Symbol':   symbol,
                 'Industry': row.get('Industry', ''),
@@ -362,13 +385,14 @@ def run_entry(watchlist, positions):
 
         time.sleep(SLEEP)
 
-    return new_entries, positions
+    return new_entries, positions, entry_snapshots
 
 
 # ─────────────────────────────────────────────
 # EMAIL
 # ─────────────────────────────────────────────
-def send_email(exits, entries, holds):
+def send_email(exits, entries, holds, alltime_pnl=None, alltime_count=None,
+               hit_count=None, miss_count=None):
     sender    = os.environ.get('GMAIL_SENDER')
     password  = os.environ.get('GMAIL_APP_PASSWORD')
     recipient = os.environ.get('GMAIL_RECIPIENT')
@@ -464,6 +488,25 @@ def send_email(exits, entries, holds):
     else:
         html += section_header('Open Positions: None')
 
+    # CUMULATIVE TRADE LOG P&L (all closed trades to date, separate from
+    # today's open-position P&L above)
+    if alltime_pnl is not None:
+        at_color = '#27ae60' if alltime_pnl >= 0 else '#e74c3c'
+        hit_rate = f'{(hit_count / alltime_count * 100):.0f}%' if alltime_count else 'N/A'
+        html += section_header('All-Time Trade Log')
+        html += f'''
+        <table style="{table_style()}"><tbody>
+            <tr>
+                <td style="{td_style()}">Closed trades</td>
+                <td style="{td_style('right')}">{alltime_count} ({hit_count} hit / {miss_count} miss, {hit_rate} hit rate)</td>
+            </tr>
+            <tr>
+                <td style="{td_style()}">Cumulative P&amp;L</td>
+                <td style="{td_style('right')}"><span style="color:{at_color}"><b>Rs.{alltime_pnl:+,.0f}</b></span></td>
+            </tr>
+        </tbody></table>
+        '''
+
     # FOOTER
     html += f'''
     <p style="margin-top:24px;font-size:12px;color:#888;">
@@ -505,6 +548,7 @@ def main(args):
     hit_log_path  = f'data/trade_log_hit_{SYSTEM_CODE}.csv'
     miss_log_path = f'data/trade_log_miss_{SYSTEM_CODE}.csv'
     wl_path       = f'data/watchlist_{SYSTEM_CODE}.csv'
+    snap_path     = f'data/entry_snapshot_{SYSTEM_CODE}.csv'
 
     try:
         # Load data from GitHub
@@ -513,11 +557,13 @@ def main(args):
         hitlog_content, hit_sha = github_get(repo_name, hit_log_path, pat)
         misslog_content, miss_sha = github_get(repo_name, miss_log_path, pat)
         wl_content, _          = github_get(repo_name, wl_path, pat)
+        snap_content, snap_sha = github_get(repo_name, snap_path, pat)
 
-        positions = parse_csv(pos_content)
-        hit_log   = parse_csv(hitlog_content)
-        miss_log  = parse_csv(misslog_content)
-        watchlist = parse_csv(wl_content)
+        positions       = parse_csv(pos_content)
+        hit_log         = parse_csv(hitlog_content)
+        miss_log        = parse_csv(misslog_content)
+        watchlist       = parse_csv(wl_content)
+        entry_snapshots = parse_csv(snap_content)
         print(f"      {len(positions)} open positions | {len(watchlist)} watchlist stocks")
 
         # Exit monitor
@@ -527,7 +573,7 @@ def main(args):
 
         # Entry scanner
         print("\n[3/5] Entry Scanner...")
-        entries, positions = run_entry(watchlist, positions)
+        entries, positions, entry_snapshots = run_entry(watchlist, positions, entry_snapshots)
         print(f"      {len(entries)} new signal(s)")
 
         # Add today's entries to holds for email
@@ -545,10 +591,11 @@ def main(args):
         print("\n[4/5] Syncing to GitHub...")
         commit_msg = f"Auto-update — {datetime.now().strftime('%Y-%m-%d')}"
 
-        pos_fields = ['Symbol', 'EntryDate', 'EntryPrice', 'Quantity', 'TrackType']
-        log_fields = ['Symbol', 'EntryDate', 'EntryPrice', 'Quantity', 'Capital',
-                      'ExitDate', 'ExitPrice', 'PnL', 'PnL%', 'DaysHeld',
-                      'ExitReason', 'TrackType']
+        pos_fields  = ['Symbol', 'EntryDate', 'EntryPrice', 'Quantity', 'TrackType']
+        log_fields  = ['Symbol', 'EntryDate', 'EntryPrice', 'Quantity', 'Capital',
+                       'ExitDate', 'ExitPrice', 'PnL', 'PnL%', 'DaysHeld',
+                       'ExitReason', 'TrackType']
+        snap_fields = ['Symbol', 'EntryDate', 'Price', 'EMA9', 'EMA30', 'EMA200', 'BBUpper']
 
         github_put(repo_name, pos_path, pat,
                    to_csv(positions, pos_fields), pos_sha, commit_msg)
@@ -556,10 +603,18 @@ def main(args):
                    to_csv(hit_log, log_fields), hit_sha, commit_msg)
         github_put(repo_name, miss_log_path, pat,
                    to_csv(miss_log, log_fields), miss_sha, commit_msg)
+        github_put(repo_name, snap_path, pat,
+                   to_csv(entry_snapshots, snap_fields), snap_sha, commit_msg)
+
+        # Cumulative trade-log P&L (all closed trades to date, hit + miss)
+        alltime_pnl = (sum(float(r['PnL']) for r in hit_log) +
+                       sum(float(r['PnL']) for r in miss_log))
+        alltime_count = len(hit_log) + len(miss_log)
 
         # Send email
         print("\n[5/5] Sending email...")
-        send_email(exits, entries, holds)
+        send_email(exits, entries, holds, alltime_pnl, alltime_count,
+                   len(hit_log), len(miss_log))
 
         print("\n  Done.\n")
         return {"statusCode": 200, "body": "Pipeline complete"}
