@@ -235,6 +235,9 @@ def run_exit(positions, hit_log, miss_log):
     """
     exits         = []
     holds         = []
+    warnings      = []   # still-open positions where price has fallen below
+                          # EMA200 but 9EMA is still above 30EMA — no forced
+                          # exit, just flagged (Sep 2026 addition)
     new_positions = []
     hit_log       = list(hit_log)
     miss_log      = list(miss_log)
@@ -316,7 +319,23 @@ def run_exit(positions, hit_log, miss_log):
                 'DaysHeld':   days_held,
             })
 
-    return exits, holds, new_positions, hit_log, miss_log
+            # Below-EMA200 warning: still "uptrend" by the EMA9/30 cross
+            # definition, but price has broken below EMA200. Not an exit
+            # trigger — just a flag, since it's only an assumption (not a
+            # confirmed rule) that the EMA9/30 stop would always fire first.
+            if (ind['ema200'] is not None and price < ind['ema200']
+                    and ind['ema9'] is not None and ind['ema30'] is not None
+                    and ind['ema9'] > ind['ema30']):
+                warnings.append({
+                    'Symbol':  symbol,
+                    'Price':   price,
+                    'EMA200':  ind['ema200'],
+                    'EMA9':    ind['ema9'],
+                    'EMA30':   ind['ema30'],
+                    'PnL%':    pnl_pct,
+                })
+
+    return exits, holds, warnings, new_positions, hit_log, miss_log
 
 
 # ─────────────────────────────────────────────
@@ -346,6 +365,14 @@ def run_entry(watchlist, positions, entry_snapshots):
             continue
 
         if ind['ema9'] is None or ind['ema30'] is None:
+            time.sleep(SLEEP)
+            continue
+
+        # Daily freshness gate: price must be above EMA200 TODAY, not just
+        # when the monthly screener last checked. The screener only
+        # guarantees the structural 3-checkpoint slope shape; this fast-
+        # moving condition is re-verified here every run (Sep 2026 change).
+        if ind['ema200'] is None or ind['price'] <= ind['ema200']:
             time.sleep(SLEEP)
             continue
 
@@ -392,7 +419,7 @@ def run_entry(watchlist, positions, entry_snapshots):
 # EMAIL
 # ─────────────────────────────────────────────
 def send_email(exits, entries, holds, alltime_pnl=None, alltime_count=None,
-               hit_count=None, miss_count=None):
+               hit_count=None, miss_count=None, warnings=None):
     sender    = os.environ.get('GMAIL_SENDER')
     password  = os.environ.get('GMAIL_APP_PASSWORD')
     recipient = os.environ.get('GMAIL_RECIPIENT')
@@ -488,6 +515,25 @@ def send_email(exits, entries, holds, alltime_pnl=None, alltime_count=None,
     else:
         html += section_header('Open Positions: None')
 
+    # BELOW-EMA200 WARNING (still uptrend by EMA cross, but price has
+    # broken below EMA200 — not an exit trigger, just flagged)
+    if warnings:
+        html += section_header(f'⚠ Below EMA200, Still EMA-Uptrend ({len(warnings)})')
+        html += f'<table style="{table_style()}"><thead><tr>'
+        for col in ['Symbol', 'Price Rs', 'EMA200 Rs', '9EMA', '30EMA', 'P&L %']:
+            html += f'<th style="{th_style()}">{col}</th>'
+        html += '</tr></thead><tbody>'
+        for w in warnings:
+            html += f'''<tr>
+                <td style="{td_style()}"><b>{w['Symbol']}</b></td>
+                <td style="{td_style('right')}">Rs.{w['Price']:.2f}</td>
+                <td style="{td_style('right')}">Rs.{w['EMA200']:.2f}</td>
+                <td style="{td_style('right')}">{w['EMA9']}</td>
+                <td style="{td_style('right')}">{w['EMA30']}</td>
+                <td style="{td_style('right')}">{w['PnL%']:+.2f}%</td>
+            </tr>'''
+        html += '</tbody></table>'
+
     # CUMULATIVE TRADE LOG P&L (all closed trades to date, separate from
     # today's open-position P&L above)
     if alltime_pnl is not None:
@@ -568,8 +614,8 @@ def main(args):
 
         # Exit monitor
         print("\n[2/5] Exit Monitor...")
-        exits, holds, positions, hit_log, miss_log = run_exit(positions, hit_log, miss_log)
-        print(f"      {len(exits)} exit(s) | {len(holds)} holding")
+        exits, holds, warnings, positions, hit_log, miss_log = run_exit(positions, hit_log, miss_log)
+        print(f"      {len(exits)} exit(s) | {len(holds)} holding | {len(warnings)} below-EMA200 warning(s)")
 
         # Entry scanner
         print("\n[3/5] Entry Scanner...")
@@ -614,7 +660,7 @@ def main(args):
         # Send email
         print("\n[5/5] Sending email...")
         send_email(exits, entries, holds, alltime_pnl, alltime_count,
-                   len(hit_log), len(miss_log))
+                   len(hit_log), len(miss_log), warnings)
 
         print("\n  Done.\n")
         return {"statusCode": 200, "body": "Pipeline complete"}
