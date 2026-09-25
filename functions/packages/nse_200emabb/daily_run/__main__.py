@@ -6,13 +6,26 @@ Uses only requests + standard library (no pip installs needed).
 - GitHub REST API for reading/writing CSV data
 - Gmail SMTP for notifications
 
-Design summary (locked, Sep 2026):
+Design summary (updated, Sep 2026):
 - Watchlist is pre-vetted uptrend-only by a SEPARATE periodic screener
-  (EMA200 3-checkpoint slope check + price-above-EMA200). This system does
-  NOT re-verify EMA200 itself — it trusts the watchlist.
-- Entry: 9 EMA currently above 30 EMA (no fresh-cross requirement — if
-  it's already true and there's no open position, that's a signal).
-- Target exit: price touches/exceeds BB-upper (20, 2 std).
+  (EMA200 3-checkpoint slope check). This system does NOT re-verify the
+  structural EMA200 slope itself — it trusts the watchlist for that.
+- Entry: FRESH confluence only. Confluence = (9EMA > 30EMA) AND
+  (price > EMA200). "Fresh" means confluence is true today but was NOT
+  true yesterday — covers both a fresh 9/30 crossover while price is
+  already above EMA200, and price freshly crossing above EMA200 while
+  9EMA was already above 30EMA. A stock sitting in confluence day after
+  day (true yesterday, true today) does NOT re-trigger an entry. This
+  replaces the earlier "currently above" level check, which was causing
+  same-day exit-then-re-entry chop on trending stocks (BB-upper exit
+  with EMA state unchanged -> instant re-entry). Under the new rule, a
+  stock that exits and is still in confluence simply doesn't re-enter
+  until confluence has gone false and come back true — i.e. it has to
+  finish its current move and start a new one. Strong trends that never
+  break confluence are intentionally let go, not re-entered — that's
+  the trade-off of specializing this system for cleaner discrete moves.
+- Target exit: price touches/exceeds BB-upper (20, 2 std). Unchanged —
+  exit logic doesn't depend on how a trade was entered.
 - Stop exit: EITHER 9 EMA currently below 30 EMA, OR price <= 10% below
   the highest daily HIGH since entry (trailing stop). If both conditions
   are true on the same day, a distinct third ExitReason (STOP_BOTH) is
@@ -136,7 +149,15 @@ def calc_bb(closes, period=BB_PERIOD, std_mult=BB_STD):
 
 
 def get_indicators(symbol, period=DATA_PERIOD):
-    """Get price + BB + 9/30 EMA indicators + raw bars for a symbol."""
+    """
+    Get price + BB + 9/30/200 EMA indicators + raw bars for a symbol.
+
+    Also computes yesterday's price/EMA9/EMA30/EMA200 (using the same
+    series with the most recent close dropped), purely so the entry
+    scanner can detect a FRESH confluence flip (false yesterday, true
+    today) rather than just today's level. Exit logic doesn't use the
+    _prev fields at all.
+    """
     bars = fetch_price_bars(symbol, period)
     if not bars or len(bars) < BB_PERIOD + 2:
         return None
@@ -150,19 +171,36 @@ def get_indicators(symbol, period=DATA_PERIOD):
 
     ema9   = calc_ema(closes, EMA_FAST)
     ema30  = calc_ema(closes, EMA_SLOW)
-    ema200 = calc_ema(closes, EMA_LONG)   # informational only — the watchlist
-                                           # screener already gates on this;
-                                           # this is just for the entry snapshot
+    ema200 = calc_ema(closes, EMA_LONG)   # used both for exit warnings and
+                                           # for today's confluence check
+
+    # Yesterday's state — same calculations, one close short. Needs one
+    # extra close of history beyond each EMA's own period, which the
+    # normal ~1y fetch comfortably has.
+    price_prev  = None
+    ema9_prev   = None
+    ema30_prev  = None
+    ema200_prev = None
+    if len(closes) > EMA_LONG:
+        closes_prev = closes[:-1]
+        price_prev  = round(closes_prev[-1], 2)
+        ema9_prev   = calc_ema(closes_prev, EMA_FAST)
+        ema30_prev  = calc_ema(closes_prev, EMA_SLOW)
+        ema200_prev = calc_ema(closes_prev, EMA_LONG)
 
     return {
-        'price':    price,
-        'bb_upper': bb['bb_upper'],
-        'bb_mid':   bb['bb_mid'],
-        'bb_lower': bb['bb_lower'],
-        'ema9':     ema9,
-        'ema30':    ema30,
-        'ema200':   ema200,
-        'bars':     bars,
+        'price':       price,
+        'bb_upper':    bb['bb_upper'],
+        'bb_mid':      bb['bb_mid'],
+        'bb_lower':    bb['bb_lower'],
+        'ema9':        ema9,
+        'ema30':       ema30,
+        'ema200':      ema200,
+        'price_prev':  price_prev,
+        'ema9_prev':   ema9_prev,
+        'ema30_prev':  ema30_prev,
+        'ema200_prev': ema200_prev,
+        'bars':        bars,
     }
 
 
@@ -339,8 +377,14 @@ def run_exit(positions, hit_log, miss_log):
 # ─────────────────────────────────────────────
 def run_entry(watchlist, positions, entry_snapshots):
     """
-    Watchlist is assumed pre-vetted (uptrend-only, via the separate monthly
-    screener). Entry signal here is purely: 9 EMA currently above 30 EMA.
+    Watchlist is assumed structurally pre-vetted (uptrend slope shape, via
+    the separate monthly screener). Entry signal here is a FRESH
+    confluence flip: (9EMA > 30EMA) AND (price > EMA200) is true today but
+    was NOT true yesterday. This covers both ways a stock can newly
+    qualify — a fresh 9/30 crossover while already above EMA200, or price
+    freshly crossing above EMA200 while 9EMA was already above 30EMA —
+    with one rule, and it naturally blocks re-entry into a stock that's
+    just sitting in confluence (unchanged state) after an earlier exit.
 
     entry_snapshots: existing rows from entry_snapshot_200emabb.csv — a
     permanent, positions-independent record of the indicator values at the
@@ -360,19 +404,22 @@ def run_entry(watchlist, positions, entry_snapshots):
             time.sleep(SLEEP)
             continue
 
-        if ind['ema9'] is None or ind['ema30'] is None:
+        if ind['ema9'] is None or ind['ema30'] is None or ind['ema200'] is None:
             time.sleep(SLEEP)
             continue
 
-        # Daily freshness gate: price must be above EMA200 TODAY, not just
-        # when the monthly screener last checked. The screener only
-        # guarantees the structural 3-checkpoint slope shape; this fast-
-        # moving condition is re-verified here every run (Sep 2026 change).
-        if ind['ema200'] is None or ind['price'] <= ind['ema200']:
+        # Need yesterday's state to judge freshness. If it's missing
+        # (e.g. right at the edge of available history), skip rather than
+        # guess — avoids mistakenly treating an old confluence as fresh.
+        if (ind['ema9_prev'] is None or ind['ema30_prev'] is None
+                or ind['ema200_prev'] is None or ind['price_prev'] is None):
             time.sleep(SLEEP)
             continue
 
-        if ind['ema9'] > ind['ema30']:
+        confluence_today = ind['ema9'] > ind['ema30'] and ind['price'] > ind['ema200']
+        confluence_prev  = ind['ema9_prev'] > ind['ema30_prev'] and ind['price_prev'] > ind['ema200_prev']
+
+        if confluence_today and not confluence_prev:
             quantity   = max(1, int(POSITION_SIZE / ind['price']))
             entry_date = datetime.now().strftime('%Y-%m-%d')
 
@@ -403,8 +450,11 @@ def run_entry(watchlist, positions, entry_snapshots):
                 'EMA30':    ind['ema30'],
                 'BB Upper': ind['bb_upper'],
             })
-            print(f"  Entry: {symbol} @ Rs.{ind['price']} "
-                  f"(9EMA {ind['ema9']} > 30EMA {ind['ema30']})")
+            print(f"  Entry: {symbol} @ Rs.{ind['price']} — fresh confluence "
+                  f"(9EMA {ind['ema9']} > 30EMA {ind['ema30']}, "
+                  f"price {ind['price']} > 200EMA {ind['ema200']}; "
+                  f"yesterday: 9EMA {ind['ema9_prev']} vs 30EMA {ind['ema30_prev']}, "
+                  f"price {ind['price_prev']} vs 200EMA {ind['ema200_prev']})")
 
         time.sleep(SLEEP)
 
