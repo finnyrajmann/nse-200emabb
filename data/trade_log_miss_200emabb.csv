@@ -1,1 +1,2 @@
 Symbol,EntryDate,EntryPrice,Quantity,Capital,ExitDate,ExitPrice,PnL,PnL%,DaysHeld,ExitReason,TrackType
+OBEROIRLTY,2026-09-30,1830.0,5,9150.0,2026-10-01,1762.9,-335.5,-3.67,1,9EMA crossed below 30EMA (1809.27 < 1815.76),Paper
