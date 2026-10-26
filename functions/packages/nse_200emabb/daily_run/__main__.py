@@ -529,7 +529,7 @@ def send_email(exits, entries, holds, alltime_pnl=None, alltime_count=None,
                 <td style="{td_style()}">{e['Industry']}</td>
                 <td style="{td_style('right')}">Rs.{e['Price']}</td>
                 <td style="{td_style('right')}">{e['EMA9']}</td>
-    recipients = [r.strip() for r in os.environ.get('GMAIL_RECIPIENT', '').split(',') if r.strip()]
+                <td style="{td_style('right')}">{e['EMA30']}</td>
                 <td style="{td_style('right')}">Rs.{e['BB Upper']}</td>
             </tr>'''
         html += '</tbody></table>'
@@ -677,7 +677,7 @@ def main(args):
                 'PnL':        0.0,
                 'PnL%':       0.0,
                 'DaysHeld':   0,
-    msg['To']      = ', '.join(recipients)
+            })
 
         # Sync to GitHub
         print("\n[4/5] Syncing to GitHub...")
