@@ -468,7 +468,7 @@ def send_email(exits, entries, holds, alltime_pnl=None, alltime_count=None,
                hit_count=None, miss_count=None, warnings=None):
     sender    = os.environ.get('GMAIL_SENDER')
     password  = os.environ.get('GMAIL_APP_PASSWORD')
-    recipient = os.environ.get('GMAIL_RECIPIENT')
+    recipients = [r.strip() for r in os.environ.get('GMAIL_RECIPIENT', '').split(',') if r.strip()]
     repo_name = os.environ.get('GITHUB_REPO')
     today     = datetime.now().strftime('%d %b %Y')
     subject   = f"NSE 200EMABB — {today} | {len(entries)} new | {len(holds)} open"
@@ -529,7 +529,7 @@ def send_email(exits, entries, holds, alltime_pnl=None, alltime_count=None,
                 <td style="{td_style()}">{e['Industry']}</td>
                 <td style="{td_style('right')}">Rs.{e['Price']}</td>
                 <td style="{td_style('right')}">{e['EMA9']}</td>
-    recipients = [r.strip() for r in os.environ.get('GMAIL_RECIPIENT', '').split(',') if r.strip()]
+                <td style="{td_style('right')}">{e['EMA30']}</td>
                 <td style="{td_style('right')}">Rs.{e['BB Upper']}</td>
             </tr>'''
         html += '</tbody></table>'
@@ -615,14 +615,14 @@ def send_email(exits, entries, holds, alltime_pnl=None, alltime_count=None,
 
     msg = MIMEMultipart()
     msg['From']    = sender
-    msg['To']      = recipient
+    msg['To']      = ', '.join(recipients)
     msg['Subject'] = subject
     msg.attach(MIMEText(html, 'html'))
 
     with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
         server.login(sender, password)
-        server.sendmail(sender, recipient, msg.as_string())
-    print(f"  Email sent to {recipient}")
+        server.sendmail(sender, recipients, msg.as_string())
+    print(f"  Email sent to {', '.join(recipients)}")
 
 
 # ─────────────────────────────────────────────
@@ -677,7 +677,7 @@ def main(args):
                 'PnL':        0.0,
                 'PnL%':       0.0,
                 'DaysHeld':   0,
-    msg['To']      = ', '.join(recipients)
+            })
 
         # Sync to GitHub
         print("\n[4/5] Syncing to GitHub...")
