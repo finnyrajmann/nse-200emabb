@@ -2,3 +2,4 @@ Symbol,EntryDate,EntryPrice,Quantity,Capital,ExitDate,ExitPrice,PnL,PnL%,DaysHel
 NYKAA,2026-10-29,342.5,29,9932.5,2026-10-30,352.9,301.6,3.04,1,Price at/above BB Upper (352.68),Paper
 WELSPUNLIV,2026-11-02,219.08,45,9858.6,2026-11-03,242.34,1046.7,10.62,1,Price at/above BB Upper (240.68),Paper
 BSE,2026-10-27,3359.0,2,6718.0,2026-11-04,3665.7,613.4,9.13,8,Price at/above BB Upper (3591.91),Paper
+ADANIGREEN,2026-11-03,1337.0,7,9359.0,2026-11-05,1388.0,357.0,3.81,2,Price at/above BB Upper (1377.2),Paper
